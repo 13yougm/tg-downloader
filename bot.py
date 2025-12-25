@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import threading
+import requests
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -9,11 +10,8 @@ import yt_dlp
 
 # --- СЕРВЕР ДЛЯ RENDER ---
 server = Flask(__name__)
-
 @server.route('/')
-@server.route('/health')
-def health_check():
-    return "OK", 200
+def health(): return "OK", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -21,84 +19,94 @@ def run_flask():
 
 threading.Thread(target=run_flask, daemon=True).start()
 
-# --- ЛОГУВАННЯ ---
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# --- КОНФІГ ---
+logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 50 * 1024 * 1024
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Бот запущений! Надішли мені посилання на відео.")
+    await update.message.reply_text("👋 Бот з підтримкою Cobalt API! Надішли посилання.")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     if not url.startswith("http"): return
     context.user_data['url'] = url
-    keyboard = [[InlineKeyboardButton("🎥 Відео", callback_data='v'), InlineKeyboardButton("🎵 MP3", callback_data='a')]]
-    await update.message.reply_text("Обери формат:", reply_markup=InlineKeyboardMarkup(keyboard))
+    kb = [[InlineKeyboardButton("🎥 Відео", callback_data='v'), InlineKeyboardButton("🎵 MP3", callback_data='a')]]
+    await update.message.reply_text("Обери формат:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     url = context.user_data.get('url')
     mode = query.data
-    
-    await query.edit_message_text("⏳ Обробка... Почекайте.")
-    
-    loop = asyncio.get_running_loop()
+    await query.edit_message_text("⏳ Завантаження через API...")
+
     try:
-        path, title = await loop.run_in_executor(None, download_media, url, mode)
-        await query.edit_message_text("⏳ Надсилаю файл...")
+        path, title = await asyncio.get_running_loop().run_in_executor(None, download_via_cobalt, url, mode)
+        await query.edit_message_text("⏳ Надсилання...")
         with open(path, 'rb') as f:
-            if mode == 'v':
-                await context.bot.send_video(chat_id=query.message.chat_id, video=f, caption=title)
-            else:
-                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title)
+            if mode == 'v': await context.bot.send_video(query.message.chat_id, f, caption=title)
+            else: await context.bot.send_audio(query.message.chat_id, f, title=title)
         await query.edit_message_text("✅ Готово!")
     except Exception as e:
-        logger.error(f"Error: {e}")
-        await query.edit_message_text(f"❌ Помилка: {str(e)[:100]}")
+        # Якщо Cobalt не зміг, пробуємо класичний метод yt-dlp як запасний
+        try:
+            await query.edit_message_text("⏳ API не зміг, пробую класичний метод...")
+            path, title = await asyncio.get_running_loop().run_in_executor(None, download_yt_dlp, url, mode)
+            with open(path, 'rb') as f:
+                if mode == 'v': await context.bot.send_video(query.message.chat_id, f, caption=title)
+                else: await context.bot.send_audio(query.message.chat_id, f, title=title)
+            await query.edit_message_text("✅ Готово (через запасний метод)!")
+        except Exception as e2:
+            await query.edit_message_text(f"❌ Помилка: Сервіс тимчасово недоступний.")
     finally:
-        if 'path' in locals() and os.path.exists(path):
-            try: os.remove(path)
-            except: pass
+        if 'path' in locals() and os.path.exists(path): os.remove(path)
 
-def download_media(url, mode):
-    if not os.path.exists('downloads'): os.makedirs('downloads')
-    
-    ydl_opts = {
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'ignoreerrors': False,
-        'source_address': '0.0.0.0', # Примусово IPv4
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'add_header': [
-            'Accept-Language: uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer: https://www.google.com/',
-        ],
+# --- МЕТОД 1: COBALT API (Основний) ---
+def download_via_cobalt(url, mode):
+    # Використовуємо офіційний API Cobalt
+    api_url = "https://api.cobalt.tools/api/json"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "url": url,
+        "vQuality": "720",
+        "isAudioOnly": True if mode == 'a' else False
     }
     
-    # Вимикаємо використання cookies, якщо їх немає
-    if mode == 'a':
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
-        })
-    else:
-        ydl_opts.update({'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'})
+    response = requests.post(api_url, json=payload, headers=headers)
+    data = response.json()
+    
+    if data.get("status") == "error":
+        raise Exception(data.get("text"))
+    
+    file_url = data.get("url")
+    file_res = requests.get(file_url, stream=True)
+    file_path = f"downloads/file_{mode}.mp4" if mode == 'v' else f"downloads/file_{mode}.mp3"
+    
+    if not os.path.exists('downloads'): os.makedirs('downloads')
+    
+    with open(file_path, 'wb') as f:
+        for chunk in file_res.iter_content(chunk_size=8192):
+            f.write(chunk)
+            
+    return file_path, "Завантажено через Cobalt"
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+# --- МЕТОД 2: YT-DLP (Запасний) ---
+def download_yt_dlp(url, mode):
+    if not os.path.exists('downloads'): os.makedirs('downloads')
+    opts = {
+        'outtmpl': 'downloads/%(id)s.%(ext)s',
+        'nocheckcertificate': True,
+        'quiet': True,
+        'format': 'bestvideo[height<=720]+bestaudio/best' if mode == 'v' else 'bestaudio/best',
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
-        if mode == 'a': path = path.rsplit('.', 1)[0] + '.mp3'
-        return path, info.get('title', 'Media')
+        p = ydl.prepare_filename(info)
+        return p, info.get('title', 'Media')
 
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.run_polling()
+    ApplicationBuilder().token(TOKEN).build().run_polling()
