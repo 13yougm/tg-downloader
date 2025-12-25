@@ -2,15 +2,12 @@ import os
 import logging
 import asyncio
 import yt_dlp
-import requests
 from flask import Flask
 from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# Flask для Koyeb
 app = Flask('')
 @app.route('/')
 def home(): return "OK", 200
@@ -22,55 +19,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     if "http" not in url: return
     
-    status = await update.message.reply_text("⏳ Завантажую... (через резервний канал)")
+    status = await update.message.reply_text("⏳ Завантажую Douyin через yt-dlp...")
 
-    # КРОК 1: Пробуємо Cobalt API (найкраще для Douyin/YouTube на хостингах)
-    try:
-        r = requests.post("https://api.cobalt.tools/api/json", 
-                         json={"url": url, "vCodec": "h264", "vQuality": "720"}, 
-                         headers={"Accept": "application/json", "Content-Type": "application/json"},
-                         timeout=15)
-        data = r.json()
-        
-        if data.get("url"):
-            await update.message.reply_video(video=data.get("url"), caption="Готово! ✅")
-            await status.delete()
-            return
-        elif data.get("status") == "picker":
-            for item in data.get("picker"):
-                await update.message.reply_photo(photo=item.get("url"))
-            await status.delete()
-            return
-    except Exception as e:
-        logger.info(f"Cobalt skip: {e}")
-
-    # КРОК 2: Якщо Cobalt не зміг, пробуємо самі через yt-dlp
-    await status.edit_text("⏳ Cobalt не відповів, пробуємо пряме завантаження...")
+    # Налаштування саме для версії 2023.11.16
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
-        'outtmpl': 'vid.mp4',
+        'format': 'best',
+        'outtmpl': 'douyin_video.mp4',
         'quiet': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
     }
 
     try:
+        # Завантаження відео
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             await asyncio.to_thread(ydl.download, [url])
         
-        if os.path.exists('vid.mp4'):
-            with open('vid.mp4', 'rb') as v:
-                await update.message.reply_video(video=v, caption="Завантажено напряму! ✅")
-            os.remove('vid.mp4')
+        # Відправка відео
+        if os.path.exists('douyin_video.mp4'):
+            with open('douyin_video.mp4', 'rb') as v:
+                await update.message.reply_video(video=v, caption="Готово! ✅ (yt-dlp)")
+            os.remove('douyin_video.mp4') # Видаляємо файл після відправки
             await status.delete()
         else:
-            raise Exception("File not found")
+            await status.edit_text("❌ Файл не знайдено після завантаження.")
+
     except Exception as e:
-        logger.error(f"Final error: {e}")
-        await status.edit_text("❌ На жаль, YouTube/Douyin заблокували запит. Спробуйте Shorts або пізніше.")
+        await status.edit_text(f"⚠️ Помилка завантаження: {str(e)[:100]}")
+        if os.path.exists('douyin_video.mp4'): os.remove('douyin_video.mp4')
 
 if __name__ == '__main__':
     Thread(target=run_flask).start()
-    app_bot = ApplicationBuilder().token(TOKEN).build()
-    app_bot.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Кидай посилання на YouTube, TikTok або Douyin!")))
-    app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app_bot.run_polling()
+    bot = ApplicationBuilder().token(TOKEN).build()
+    bot.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Кидай посилання на Douyin!")))
+    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    bot.run_polling()
