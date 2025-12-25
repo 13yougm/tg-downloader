@@ -2,72 +2,74 @@ import os
 import logging
 import asyncio
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import yt_dlp
 
-# --- СЕРВЕР ДЛЯ RENDER ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Alive")
+# --- МІНІ-СЕРВЕР ДЛЯ RENDER (Flask краще обробляє запити) ---
+server = Flask(__name__)
 
-def run_health_server():
+@server.route('/')
+@server.route('/health')
+def health_check():
+    return "OK", 200
+
+def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+    server.run(host='0.0.0.0', port=port)
 
-threading.Thread(target=run_health_server, daemon=True).start()
+# Запускаємо сервер у фоні
+threading.Thread(target=run_flask, daemon=True).start()
+# ---------------------------------------------------------
 
-# --- КОНФІГ ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 50 * 1024 * 1024
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Надішліть посилання на відео.")
+    await update.message.reply_text("👋 Бот онлайн! Надішли посилання на відео.")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     if not url.startswith("http"): return
     context.user_data['url'] = url
-    kb = [[InlineKeyboardButton("🎥 Відео", callback_data='v'), InlineKeyboardButton("🎵 MP3", callback_data='a')]]
-    await update.message.reply_text("Оберіть формат:", reply_markup=InlineKeyboardMarkup(kb))
+    keyboard = [[InlineKeyboardButton("🎥 Відео", callback_data='v'), InlineKeyboardButton("🎵 MP3", callback_data='a')]]
+    await update.message.reply_text("Формат:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     url = context.user_data.get('url')
-    f_type = query.data
-    await query.edit_message_text("⏳ Завантаження...")
+    await query.edit_message_text("⏳ Завантажую...")
     
+    loop = asyncio.get_running_loop()
     try:
-        path, title = await asyncio.get_running_loop().run_in_executor(None, download, url, f_type)
-        await query.edit_message_text("⏳ Надсилання...")
+        path, title = await loop.run_in_executor(None, download_media, url, query.data)
+        await query.edit_message_text("⏳ Надсилаю...")
         with open(path, 'rb') as f:
-            if f_type == 'v': await context.bot.send_video(query.message.chat_id, f, caption=title)
-            else: await context.bot.send_audio(query.message.chat_id, f, title=title)
+            if query.data == 'v':
+                await context.bot.send_video(chat_id=query.message.chat_id, video=f, caption=title)
+            else:
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title)
         await query.edit_message_text("✅ Готово!")
     except Exception as e:
-        await query.edit_message_text(f"❌ Помилка: SSL/Network error. Спробуйте ще раз.")
+        logger.error(e)
+        await query.edit_message_text(f"❌ Помилка: {str(e)[:50]}")
     finally:
         if 'path' in locals() and os.path.exists(path): os.remove(path)
 
-def download(url, mode):
+def download_media(url, mode):
     if not os.path.exists('downloads'): os.makedirs('downloads')
-    
     opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'nocheckcertificate': True,  # Пряме вимкнення перевірки SSL
-        'no_check_certificate': True, # Подвійний контроль
         'quiet': True,
+        'nocheckcertificate': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     }
-    
     if os.path.exists('cookies.txt'): opts['cookiefile'] = 'cookies.txt'
-    
     if mode == 'a':
         opts.update({'format': 'bestaudio', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]})
     else:
@@ -75,9 +77,13 @@ def download(url, mode):
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
-        if mode == 'a': path = path.rsplit('.', 1)[0] + '.mp3'
-        return path, info.get('title', 'Media')
+        p = ydl.prepare_filename(info)
+        if mode == 'a': p = p.rsplit('.', 1)[0] + '.mp3'
+        return p, info.get('title', 'Media')
 
 if __name__ == '__main__':
-    ApplicationBuilder().token(TOKEN).build().run_polling()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.run_polling()
