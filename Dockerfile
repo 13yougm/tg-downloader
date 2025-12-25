@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Встановлюємо ffmpeg та оновлюємо сертифікати
+# Встановлюємо системні залежності та оновлюємо сертифікати
 RUN apt-get update && \
     apt-get install -y ffmpeg git ca-certificates && \
     update-ca-certificates && \
@@ -10,9 +10,12 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Додатково оновлюємо сертифікати Python
+RUN pip install --upgrade certifi
 
 COPY . .
 
+# Порт для Render
 ENV PORT=8080
 EXPOSE 8080
 
