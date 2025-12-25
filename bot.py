@@ -2,16 +2,16 @@ import os
 import logging
 import asyncio
 import threading
-import requests
 import os.path
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+import yt_dlp
 
 # --- СЕРВЕР ДЛЯ RENDER ---
 server = Flask(__name__)
 @server.route('/')
-def health(): return "Статус: Бот онлайн", 200
+def health(): return "ONLINE", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -25,70 +25,41 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-# --- МЕТОДИ ЗАВАНТАЖЕННЯ ---
-
-def download_file(url, mode):
-    """Скачування файлу за прямим посиланням"""
+# --- ФУНКЦІЯ ЗАВАНТАЖЕННЯ ---
+def download_media(url, mode):
     if not os.path.exists('downloads'): os.makedirs('downloads')
-    ext = "mp3" if mode == 'a' else "mp4"
-    path = f"downloads/file_{os.urandom(2).hex()}.{ext}"
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-    res = requests.get(url, stream=True, timeout=120, headers=headers)
-    with open(path, 'wb') as f:
-        for chunk in res.iter_content(chunk_size=1024*1024):
-            if chunk: f.write(chunk)
-    return path
-
-def try_cobalt(url, mode):
-    """Метод 1: Оновлений Cobalt API (Обхід помилки v7)"""
-    # Ми використовуємо той самий URL, але НОВУ структуру даних
-    api_url = "https://api.cobalt.tools/api/json"
-    
-    # ЦІ ЗАГОЛОВКИ ОБОВ'ЯЗКОВІ, щоб не було помилки v7
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://cobalt.tools",
-        "Referer": "https://cobalt.tools/"
+    # Налаштування для обходу блокувань
+    ydl_opts = {
+        'format': 'bestaudio/best' if mode == 'a' else 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': f'downloads/%(id)s_{os.urandom(2).hex()}.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'add_header': [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language: en-US,en;q=0.5',
+        ],
     }
-    
-    payload = {
-        "url": url,
-        "videoQuality": "720",
-        "downloadMode": "audio" if mode == 'a' else "video",
-        "filenameStyle": "pretty"
-    }
-    
-    res = requests.post(api_url, json=payload, headers=headers, timeout=20)
-    data = res.json()
-    
-    if data.get("status") == "error": 
-        raise Exception(data.get("text"))
-    
-    return download_file(data.get("url"), mode), "Cobalt (v10 Logic)"
 
-def try_tikwm(url, mode):
-    """Метод 2: TikWM API (Ідеально для TikTok/Douyin, як tiqu.cc)"""
-    api_url = "https://www.tikwm.com/api/"
-    res = requests.post(api_url, data={'url': url}, timeout=20)
-    res_data = res.json()
-    
-    if not res_data.get('data'): 
-        raise Exception("TikWM error")
-    
-    data = res_data['data']
-    file_url = data.get('music') if mode == 'a' else data.get('play')
-    
-    if not file_url.startswith("http"):
-        file_url = "https://www.tikwm.com" + file_url
-        
-    return download_file(file_url, mode), "TikWM/Tiqu"
+    if mode == 'a':
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        file_path = ydl.prepare_filename(info)
+        if mode == 'a':
+            file_path = file_path.rsplit('.', 1)[0] + '.mp3'
+        return file_path
 
 # --- ОБРОБНИКИ ТЕЛЕГРАМ ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Бот виправлений! Тепер працює YouTube та Douyin.")
+    await update.message.reply_text("👋 Бот знову в строю! Надішліть посилання на відео.")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -103,33 +74,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.user_data.get('url')
     mode = query.data
     
-    await query.edit_message_text("⏳ Завантажую... Це займе кілька секунд.")
-    path = None
+    status = await query.edit_message_text("⏳ Починаю завантаження... Це може зайняти до 2-х хвилин.")
     
+    path = None
     try:
-        # Авто-вибір сервісу
-        if "douyin.com" in url or "tiktok.com" in url:
-            try:
-                path, srv = await asyncio.get_running_loop().run_in_executor(None, try_tikwm, url, mode)
-            except:
-                path, srv = await asyncio.get_running_loop().run_in_executor(None, try_cobalt, url, mode)
-        else:
-            try:
-                path, srv = await asyncio.get_running_loop().run_in_executor(None, try_cobalt, url, mode)
-            except:
-                path, srv = await asyncio.get_running_loop().run_in_executor(None, try_tikwm, url, mode)
-
-        await query.edit_message_text(f"🚀 Файл готовий ({srv}). Надсилаю...")
+        # Запускаємо завантаження в окремому потоці, щоб не блокувати бота
+        path = await asyncio.get_running_loop().run_in_executor(None, download_media, url, mode)
+        
+        await query.edit_message_text("🚀 Файл завантажено на сервер! Надсилаю в чат...")
         with open(path, 'rb') as f:
-            if mode == 'v': await context.bot.send_video(chat_id=query.message.chat_id, video=f)
-            else: await context.bot.send_audio(chat_id=query.message.chat_id, audio=f)
+            if mode == 'v':
+                await context.bot.send_video(chat_id=query.message.chat_id, video=f, read_timeout=120, write_timeout=120)
+            else:
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, read_timeout=120, write_timeout=120)
+        
         await query.edit_message_text("✅ Готово!")
-
     except Exception as e:
         logger.error(f"Error: {e}")
-        await query.edit_message_text(f"❌ Помилка завантаження. Спробуйте інше посилання.")
+        await query.edit_message_text(f"❌ Помилка: Ютуб заблокував цей запит. Спробуйте інше посилання або TikTok.")
     finally:
-        if path and os.path.exists(path): os.remove(path)
+        if path and os.path.exists(path):
+            os.remove(path)
 
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
@@ -137,3 +102,4 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling(drop_pending_updates=True)
+
