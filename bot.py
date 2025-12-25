@@ -16,7 +16,6 @@ def health():
     return "Бот працює!", 200
 
 def run_flask():
-    # Render автоматично надає порт через змінну середовища PORT
     port = int(os.environ.get("PORT", 10000))
     server.run(host='0.0.0.0', port=port)
 
@@ -30,7 +29,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("BOT_TOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привіт! Я готовий завантажувати відео з YouTube, TikTok, Instagram та Douyin.\n\nПросто надішліть мені посилання!")
+    await update.message.reply_text("👋 Привіт! Я допоможу тобі завантажити відео.\n\nПросто надішли посилання з YouTube, Instagram або TikTok!")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -42,7 +41,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎥 Відео", callback_data='v'),
          InlineKeyboardButton("🎵 Аудіо (MP3)", callback_data='a')]
     ]
-    await update.message.reply_text("Оберіть формат для завантаження:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Оберіть формат:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -51,16 +50,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.user_data.get('url')
     mode = query.data
     
-    status_msg = await query.edit_message_text("⏳ Починаю завантаження... Почекайте, будь ласка.")
+    status_msg = await query.edit_message_text("⏳ Готую посилання через Cobalt API...")
     
     loop = asyncio.get_running_loop()
     try:
-        # Спочатку пробуємо через Cobalt API (найбільш надійний метод)
+        # Пріоритет: Cobalt API (працює без cookies)
         try:
             path, title = await loop.run_in_executor(None, download_via_cobalt, url, mode)
         except Exception as e:
-            logger.warning(f"Cobalt API failed, trying yt-dlp: {e}")
-            # Якщо API не спрацював, пробуємо класичний yt-dlp
+            logger.warning(f"Cobalt error: {e}. Falling back to yt-dlp.")
+            await query.edit_message_text(f"⚠️ Cobalt не зміг, пробую пряме завантаження...")
             path, title = await loop.run_in_executor(None, download_yt_dlp, url, mode)
 
         await query.edit_message_text("⏳ Надсилаю файл у Telegram...")
@@ -71,43 +70,55 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title)
         
-        await query.edit_message_text("✅ Завантаження завершено!")
+        await query.edit_message_text("✅ Готово!")
         
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        await query.edit_message_text(f"❌ Вибачте, сталася помилка: {str(e)[:100]}")
+        logger.error(f"Error: {e}")
+        await query.edit_message_text(f"❌ Помилка: {str(e)[:100]}")
     finally:
         if 'path' in locals() and os.path.exists(path):
             try: os.remove(path)
             except: pass
 
-# --- МЕТОД 1: COBALT API ---
+# --- МЕТОД 1: COBALT API (Актуальна версія) ---
 def download_via_cobalt(url, mode):
     api_url = "https://api.cobalt.tools/api/json"
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    payload = {
-        "url": url,
-        "vQuality": "720",
-        "isAudioOnly": True if mode == 'a' else False
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
     }
     
-    response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+    # Оновлений формат payload для Cobalt API v10+
+    payload = {
+        "url": url,
+        "videoQuality": "720",
+        "filenameStyle": "pretty",
+        "downloadMode": "audio" if mode == 'a' else "video"
+    }
+    
+    response = requests.post(api_url, json=payload, headers=headers, timeout=20)
+    if response.status_code != 200:
+        raise Exception(f"API Error {response.status_code}")
+        
     data = response.json()
     
     if data.get("status") == "error":
         raise Exception(data.get("text"))
     
     file_url = data.get("url")
-    file_res = requests.get(file_url, stream=True, timeout=60)
+    if not file_url:
+        raise Exception("Не вдалося отримати посилання на файл")
+        
+    file_res = requests.get(file_url, stream=True, timeout=120)
     
     if not os.path.exists('downloads'): os.makedirs('downloads')
-    file_path = f"downloads/file_{mode}_{os.urandom(4).hex()}" + (".mp4" if mode == 'v' else ".mp3")
+    file_path = f"downloads/file_{mode}_{os.urandom(2).hex()}" + (".mp4" if mode == 'v' else ".mp3")
     
     with open(file_path, 'wb') as f:
-        for chunk in file_res.iter_content(chunk_size=8192):
-            f.write(chunk)
+        for chunk in file_res.iter_content(chunk_size=1024*1024): # 1MB chunks
+            if chunk: f.write(chunk)
             
-    return file_path, "Завантажено через Cobalt"
+    return file_path, "Завантажено успішно"
 
 # --- МЕТОД 2: YT-DLP (Запасний) ---
 def download_yt_dlp(url, mode):
@@ -117,7 +128,6 @@ def download_yt_dlp(url, mode):
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
         'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
     
     if mode == 'a':
@@ -135,10 +145,9 @@ def download_yt_dlp(url, mode):
             path = path.rsplit('.', 1)[0] + '.mp3'
         return path, info.get('title', 'Media')
 
-# --- ЗАПУСК ---
 if __name__ == '__main__':
     if not TOKEN:
-        raise ValueError("BOT_TOKEN не знайдено в змінних середовища!")
+        raise ValueError("BOT_TOKEN missing!")
         
     app = ApplicationBuilder().token(TOKEN).build()
     
@@ -146,6 +155,5 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(button_callback))
     
-    logger.info("Бот запускається з drop_pending_updates=True...")
-    # drop_pending_updates=True — очищує всі старі повідомлення, щоб не було конфлікту
+    logger.info("Бот готовий до роботи...")
     app.run_polling(drop_pending_updates=True)
