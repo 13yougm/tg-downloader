@@ -8,85 +8,100 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import yt_dlp
 
-# --- СЕРВЕР ДЛЯ RENDER ---
+# --- СЕРВЕР ДЛЯ RENDER (Health Check) ---
 server = Flask(__name__)
+
 @server.route('/')
-def health(): return "OK", 200
+def health():
+    return "Бот працює!", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    # Render автоматично надає порт через змінну середовища PORT
+    port = int(os.environ.get("PORT", 10000))
     server.run(host='0.0.0.0', port=port)
 
+# Запускаємо веб-сервер у фоновому режимі
 threading.Thread(target=run_flask, daemon=True).start()
 
-# --- КОНФІГ ---
-logging.basicConfig(level=logging.INFO)
+# --- КОНФІГУРАЦІЯ БОТА ---
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 TOKEN = os.getenv("BOT_TOKEN")
-MAX_SIZE = 50 * 1024 * 1024
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Бот з підтримкою Cobalt API! Надішли посилання.")
+    await update.message.reply_text("👋 Привіт! Я готовий завантажувати відео з YouTube, TikTok, Instagram та Douyin.\n\nПросто надішліть мені посилання!")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    if not url.startswith("http"): return
+    if not url.startswith("http"):
+        return
+    
     context.user_data['url'] = url
-    kb = [[InlineKeyboardButton("🎥 Відео", callback_data='v'), InlineKeyboardButton("🎵 MP3", callback_data='a')]]
-    await update.message.reply_text("Обери формат:", reply_markup=InlineKeyboardMarkup(kb))
+    keyboard = [
+        [InlineKeyboardButton("🎥 Відео", callback_data='v'),
+         InlineKeyboardButton("🎵 Аудіо (MP3)", callback_data='a')]
+    ]
+    await update.message.reply_text("Оберіть формат для завантаження:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
     url = context.user_data.get('url')
     mode = query.data
-    await query.edit_message_text("⏳ Завантаження через API...")
-
+    
+    status_msg = await query.edit_message_text("⏳ Починаю завантаження... Почекайте, будь ласка.")
+    
+    loop = asyncio.get_running_loop()
     try:
-        path, title = await asyncio.get_running_loop().run_in_executor(None, download_via_cobalt, url, mode)
-        await query.edit_message_text("⏳ Надсилання...")
-        with open(path, 'rb') as f:
-            if mode == 'v': await context.bot.send_video(query.message.chat_id, f, caption=title)
-            else: await context.bot.send_audio(query.message.chat_id, f, title=title)
-        await query.edit_message_text("✅ Готово!")
-    except Exception as e:
-        # Якщо Cobalt не зміг, пробуємо класичний метод yt-dlp як запасний
+        # Спочатку пробуємо через Cobalt API (найбільш надійний метод)
         try:
-            await query.edit_message_text("⏳ API не зміг, пробую класичний метод...")
-            path, title = await asyncio.get_running_loop().run_in_executor(None, download_yt_dlp, url, mode)
-            with open(path, 'rb') as f:
-                if mode == 'v': await context.bot.send_video(query.message.chat_id, f, caption=title)
-                else: await context.bot.send_audio(query.message.chat_id, f, title=title)
-            await query.edit_message_text("✅ Готово (через запасний метод)!")
-        except Exception as e2:
-            await query.edit_message_text(f"❌ Помилка: Сервіс тимчасово недоступний.")
-    finally:
-        if 'path' in locals() and os.path.exists(path): os.remove(path)
+            path, title = await loop.run_in_executor(None, download_via_cobalt, url, mode)
+        except Exception as e:
+            logger.warning(f"Cobalt API failed, trying yt-dlp: {e}")
+            # Якщо API не спрацював, пробуємо класичний yt-dlp
+            path, title = await loop.run_in_executor(None, download_yt_dlp, url, mode)
 
-# --- МЕТОД 1: COBALT API (Основний) ---
+        await query.edit_message_text("⏳ Надсилаю файл у Telegram...")
+        
+        with open(path, 'rb') as f:
+            if mode == 'v':
+                await context.bot.send_video(chat_id=query.message.chat_id, video=f, caption=title)
+            else:
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title)
+        
+        await query.edit_message_text("✅ Завантаження завершено!")
+        
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        await query.edit_message_text(f"❌ Вибачте, сталася помилка: {str(e)[:100]}")
+    finally:
+        if 'path' in locals() and os.path.exists(path):
+            try: os.remove(path)
+            except: pass
+
+# --- МЕТОД 1: COBALT API ---
 def download_via_cobalt(url, mode):
-    # Використовуємо офіційний API Cobalt
     api_url = "https://api.cobalt.tools/api/json"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     payload = {
         "url": url,
         "vQuality": "720",
         "isAudioOnly": True if mode == 'a' else False
     }
     
-    response = requests.post(api_url, json=payload, headers=headers)
+    response = requests.post(api_url, json=payload, headers=headers, timeout=30)
     data = response.json()
     
     if data.get("status") == "error":
         raise Exception(data.get("text"))
     
     file_url = data.get("url")
-    file_res = requests.get(file_url, stream=True)
-    file_path = f"downloads/file_{mode}.mp4" if mode == 'v' else f"downloads/file_{mode}.mp3"
+    file_res = requests.get(file_url, stream=True, timeout=60)
     
     if not os.path.exists('downloads'): os.makedirs('downloads')
+    file_path = f"downloads/file_{mode}_{os.urandom(4).hex()}" + (".mp4" if mode == 'v' else ".mp3")
     
     with open(file_path, 'wb') as f:
         for chunk in file_res.iter_content(chunk_size=8192):
@@ -97,16 +112,40 @@ def download_via_cobalt(url, mode):
 # --- МЕТОД 2: YT-DLP (Запасний) ---
 def download_yt_dlp(url, mode):
     if not os.path.exists('downloads'): os.makedirs('downloads')
-    opts = {
+    
+    ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'nocheckcertificate': True,
         'quiet': True,
-        'format': 'bestvideo[height<=720]+bestaudio/best' if mode == 'v' else 'bestaudio/best',
+        'nocheckcertificate': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        p = ydl.prepare_filename(info)
-        return p, info.get('title', 'Media')
+    
+    if mode == 'a':
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
+        })
+    else:
+        ydl_opts.update({'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'})
 
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+        if mode == 'a':
+            path = path.rsplit('.', 1)[0] + '.mp3'
+        return path, info.get('title', 'Media')
+
+# --- ЗАПУСК ---
 if __name__ == '__main__':
-    ApplicationBuilder().token(TOKEN).build().run_polling()
+    if not TOKEN:
+        raise ValueError("BOT_TOKEN не знайдено в змінних середовища!")
+        
+    app = ApplicationBuilder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    
+    logger.info("Бот запускається з drop_pending_updates=True...")
+    # drop_pending_updates=True — очищує всі старі повідомлення, щоб не було конфлікту
+    app.run_polling(drop_pending_updates=True)
