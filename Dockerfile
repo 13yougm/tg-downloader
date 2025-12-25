@@ -5,12 +5,13 @@ RUN apt-get update && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Вимикаємо перевірку SSL для Python на рівні системи
 ENV PYTHONHTTPSVERIFY=0
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade certifi
+
 COPY . .
 
 ENV PORT=8080
