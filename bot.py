@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-import glob
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 import yt_dlp
@@ -15,11 +14,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN env variable is missing!")
 
-# Ліміт 50 МБ
+# Ліміт 50 МБ (ліміт Telegram Bot API для завантаження файлів ботом)
 MAX_SIZE = 50 * 1024 * 1024
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привіт! Надішли мені посилання на відео (YouTube, TikTok, Insta, FB, Pinterest).")
+    await update.message.reply_text("👋 Привіт! Надішли мені посилання на відео (YouTube, TikTok, Insta, Pinterest).")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -33,7 +32,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎵 Аудіо (MP3)", callback_data='audio')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Виберіть формат:", reply_markup=reply_markup)
+    await update.message.reply_text("Обери формат:", reply_markup=reply_markup)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -46,22 +45,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Посилання втрачено. Надішліть знову.")
         return
 
-    status_msg = await query.edit_message_text(f"⏳ Статус: Завантажую...")
+    await query.edit_message_text(f"⏳ Статус: Завантажую...")
     
     loop = asyncio.get_running_loop()
     try:
-        # Виконуємо завантаження
+        # Запуск завантаження в окремому потоці, щоб не блокувати бота
         file_path, title = await loop.run_in_executor(None, download_media, url, format_type)
         
         if not file_path or not os.path.exists(file_path):
-            raise Exception("Файл не знайдено після завантаження")
+            raise Exception("Файл не створено.")
 
         if os.path.getsize(file_path) > MAX_SIZE:
-            await query.edit_message_text("❌ Файл занадто великий (> 50 МБ).")
+            await query.edit_message_text("❌ Файл більший за 50 МБ. Telegram не дозволяє мені його відправити.")
             os.remove(file_path)
             return
 
-        await query.edit_message_text("⏳ Статус: Відправляю у Telegram...")
+        await query.edit_message_text("⏳ Статус: Надсилаю файл...")
         
         with open(file_path, 'rb') as f:
             if format_type == 'video':
@@ -73,34 +72,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logger.error(f"Error: {e}")
-        error_text = str(e)
-        if "confirm you are not a bot" in error_text.lower():
-            await query.edit_message_text("❌ YouTube заблокував запит. Спробуйте інше посилання або TikTok/Insta.")
-        else:
-            await query.edit_message_text(f"❌ Помилка: Обмежений доступ або невірне посилання.")
+        await query.edit_message_text(f"❌ Помилка. Можливо, відео приватне або заблоковане.")
     finally:
+        # Видалення файлу після відправки
         if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
 
 def download_media(url, format_type):
-    # Папка для завантажень
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
         
     output_template = f'downloads/%(id)s.%(ext)s'
     
-    # Налаштування для обходу блокувань
     ydl_opts = {
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
         'restrictfilenames': True,
-        # Імітація реального браузера
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'referer': 'https://www.google.com/',
         'nocheckcertificate': True,
         'geo_bypass': True,
     }
+
+    # Використовувати cookies.txt, якщо він є в папці
+    if os.path.exists('cookies.txt'):
+        ydl_opts['cookiefile'] = 'cookies.txt'
 
     if format_type == 'audio':
         ydl_opts.update({
@@ -112,7 +109,7 @@ def download_media(url, format_type):
             }],
         })
     else:
-        # Пріоритет на MP4 до 1080p, щоб не перевищити ліміт 50МБ
+        # Намагаємося взяти MP4 до 1080p
         ydl_opts.update({
             'format': 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         })
