@@ -15,17 +15,19 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN env variable is missing!")
 
-# Ліміт 50 МБ (у байтах)
+# Ліміт 50 МБ
 MAX_SIZE = 50 * 1024 * 1024
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привіт! Надішли мені посилання на відео (YouTube, TikTok, Insta, FB), і я завантажу його.")
+    await update.message.reply_text("👋 Привіт! Надішли мені посилання на відео (YouTube, TikTok, Insta, FB, Pinterest).")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    # Зберігаємо URL у контексті користувача
+    if not url.startswith("http"):
+        await update.message.reply_text("❌ Це не схоже на посилання.")
+        return
+        
     context.user_data['url'] = url
-    
     keyboard = [
         [InlineKeyboardButton("🎥 Відео", callback_data='video')],
         [InlineKeyboardButton("🎵 Аудіо (MP3)", callback_data='audio')]
@@ -44,53 +46,64 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Посилання втрачено. Надішліть знову.")
         return
 
-    await query.edit_message_text(f"⏳ Статус: Завантажую ({format_type})...")
+    status_msg = await query.edit_message_text(f"⏳ Статус: Завантажую...")
     
-    # Запуск важкого процесу в окремому потоці
     loop = asyncio.get_running_loop()
     try:
+        # Виконуємо завантаження
         file_path, title = await loop.run_in_executor(None, download_media, url, format_type)
         
-        # Перевірка розміру
+        if not file_path or not os.path.exists(file_path):
+            raise Exception("Файл не знайдено після завантаження")
+
         if os.path.getsize(file_path) > MAX_SIZE:
-            await query.edit_message_text("❌ Помилка: Файл більше 50 МБ (ліміт Telegram Bot API).")
+            await query.edit_message_text("❌ Файл занадто великий (> 50 МБ).")
             os.remove(file_path)
             return
 
-        await query.edit_message_text("⏳ Статус: Відправляю...")
+        await query.edit_message_text("⏳ Статус: Відправляю у Telegram...")
         
-        chat_id = query.message.chat_id
         with open(file_path, 'rb') as f:
             if format_type == 'video':
-                await context.bot.send_video(chat_id=chat_id, video=f, caption=f"🎥 {title}")
+                await context.bot.send_video(chat_id=query.message.chat_id, video=f, caption=f"✅ {title}")
             else:
-                await context.bot.send_audio(chat_id=chat_id, audio=f, title=title, caption=f"🎵 {title}")
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f, title=title)
         
         await query.edit_message_text("✅ Готово!")
         
     except Exception as e:
         logger.error(f"Error: {e}")
-        await query.edit_message_text("❌ Помилка при завантаженні/відправці. Перевірте посилання або приватність.")
+        error_text = str(e)
+        if "confirm you are not a bot" in error_text.lower():
+            await query.edit_message_text("❌ YouTube заблокував запит. Спробуйте інше посилання або TikTok/Insta.")
+        else:
+            await query.edit_message_text(f"❌ Помилка: Обмежений доступ або невірне посилання.")
     finally:
-        # Очистка файлів
-        if 'file_path' in locals() and file_path and os.path.exists(file_path):
+        if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
 
 def download_media(url, format_type):
-    """Синхронна функція завантаження через yt-dlp"""
-    # Унікальне ім'я для файлу
+    # Папка для завантажень
+    if not os.path.exists('downloads'):
+        os.makedirs('downloads')
+        
     output_template = f'downloads/%(id)s.%(ext)s'
     
-    opts = {
+    # Налаштування для обходу блокувань
+    ydl_opts = {
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
-        'max_filesize': MAX_SIZE, # Спроба обмежити на рівні yt-dlp
-        'restrictfilenames': True, # Без спецсимволів
+        'restrictfilenames': True,
+        # Імітація реального браузера
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'referer': 'https://www.google.com/',
+        'nocheckcertificate': True,
+        'geo_bypass': True,
     }
 
     if format_type == 'audio':
-        opts.update({
+        ydl_opts.update({
             'format': 'bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -99,18 +112,16 @@ def download_media(url, format_type):
             }],
         })
     else:
-        # MP4 формат, не більше 1080p, щоб влізти в ліміт
-        opts.update({
-            'format': 'bestvideo[ext=mp4][filesize<50M]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        # Пріоритет на MP4 до 1080p, щоб не перевищити ліміт 50МБ
+        ydl_opts.update({
+            'format': 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         })
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         title = info.get('title', 'Media')
         
-        # Знаходимо завантажений файл
         if format_type == 'audio':
-            # Після конвертації розширення mp3
             filename = ydl.prepare_filename(info).rsplit('.', 1)[0] + '.mp3'
         else:
             filename = ydl.prepare_filename(info)
@@ -118,15 +129,8 @@ def download_media(url, format_type):
     return filename, title
 
 if __name__ == '__main__':
-    # Створюємо папку для завантажень
-    if not os.path.exists('downloads'):
-        os.makedirs('downloads')
-
     app = ApplicationBuilder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(CallbackQueryHandler(button_callback))
-
-    print("Bot is running...")
     app.run_polling()
