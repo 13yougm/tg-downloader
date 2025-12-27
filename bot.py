@@ -6,22 +6,29 @@ from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# Flask для Koyeb (щоб сервіс був Healthy)
+# Налаштування логування для відстеження помилок у консолі Koyeb
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Flask-сервер, щоб Koyeb не вимикав бота через відсутність активності на порті
 app = Flask('')
 @app.route('/')
-def home(): return "API Bot is Live", 200
-def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
+def home(): return "Бот працює на RapidAPI", 200
+def run_flask(): 
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port)
 
-# Дані з твого запиту
+# Дані RapidAPI, які ти знайшов
 RAPID_API_KEY = "f34d963ae4msh8d0868c59a60488p1d3362jsn35a7e001db2a"
 RAPID_API_HOST = "social-download-all-in-one.p.rapidapi.com"
 API_URL = "https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
-    if not url.startswith("http"): return
+    if not url or not url.startswith("http"):
+        return
     
-    status_msg = await update.message.reply_text("🚀 Обробка через RapidAPI...")
+    status_msg = await update.message.reply_text("⏳ Обробка посилання через сервер...")
 
     headers = {
         "Content-Type": "application/json",
@@ -29,47 +36,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "x-rapidapi-key": RAPID_API_KEY
     }
     
-    # Тіло запиту згідно з cURL
     payload = {"url": url}
 
     try:
+        # Запит до API
         response = requests.post(API_URL, json=payload, headers=headers, timeout=30)
         data = response.json()
 
-        # Розбір відповіді: зазвичай API повертає об'єкт з полем 'medias'
+        # Логування відповіді для налагодження (бачно в логах Koyeb)
+        logger.info(f"API Response: {data}")
+
+        # Перевірка на помилку від самого сервісу
+        if data.get("status") == "error" or "error" in data:
+            error_text = data.get("message") or data.get("error", "Unknown error")
+            await status_msg.edit_text(f"❌ Помилка сервісу: {error_text}")
+            return
+
+        # Пошук прямого посилання на відео
+        video_url = None
         medias = data.get("medias", [])
         
-        video_url = None
-        # Шукаємо перше доступне відео в списку medias
-        for item in medias:
-            if item.get("extension") == "mp4" or item.get("type") == "video":
-                video_url = item.get("url")
-                break
+        # Спершу шукаємо в списку медіафайлів
+        if isinstance(medias, list):
+            for item in medias:
+                # Шукаємо mp4 відео (зазвичай це найкраща якість)
+                if item.get("type") == "video" or item.get("extension") == "mp4":
+                    video_url = item.get("url")
+                    break
         
-        # Якщо структура інша, спробуємо пряме посилання
+        # Якщо в medias нічого немає, перевіряємо кореневі ключі
         if not video_url:
-            video_url = data.get("url") or data.get("link")
+            video_url = data.get("url") or data.get("link") or data.get("download_url")
 
         if video_url:
-            await update.message.reply_video(video=video_url, caption="✅ Готово!")
-            await status_msg.delete()
+            try:
+                # Надсилаємо відео файлом
+                await update.message.reply_video(video=video_url, caption="✅ Завантажено успішно!")
+                await status_msg.delete()
+            except Exception:
+                # Якщо Telegram не може завантажити посилання (наприклад, воно завелике)
+                await status_msg.edit_text(f"✅ Посилання знайдено, але Telegram не зміг завантажити файл.\n\n🔗 [Натисніть тут, щоб завантажити]({video_url})", parse_mode='Markdown')
         else:
-            await status_msg.edit_text("❌ Відео не знайдено. Можливо, посилання приватне.")
-            print(f"DEBUG DATA: {data}") # Побачимо структуру в логах Koyeb
+            await status_msg.edit_text("❌ Не вдалося отримати пряме посилання на відео.")
 
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await status_msg.edit_text(f"⚠️ Помилка API: {str(e)[:100]}")
+        logger.error(f"General error: {e}")
+        await status_msg.edit_text(f"⚠️ Помилка з'єднання: {str(e)[:100]}")
 
 if __name__ == '__main__':
-    # Створюємо папку для логів, якщо треба
-    logging.basicConfig(level=logging.INFO)
-    
-    # Запуск Flask
+    # Запуск веб-сервера у фоновому потоці
     Thread(target=run_flask).start()
     
-    # Запуск Telegram бота
-    token = os.environ.get('BOT_TOKEN')
-    application = ApplicationBuilder().token(token).build()
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.run_polling()
+    # Запуск Telegram-бота
+    TOKEN = os.environ.get('BOT_TOKEN')
+    if not TOKEN:
+        print("ПОМИЛКА: Немає BOT_TOKEN в змінних оточення!")
+    else:
+        application = ApplicationBuilder().token(TOKEN).build()
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.run_polling()
