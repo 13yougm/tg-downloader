@@ -1,72 +1,75 @@
 import os
-import asyncio
-import yt_dlp
+import requests
 import logging
 from flask import Flask
 from threading import Thread
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# Налаштування логів
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # Flask для Koyeb (щоб сервіс був Healthy)
 app = Flask('')
 @app.route('/')
-def home(): return "Бот активний", 200
+def home(): return "API Bot is Live", 200
 def run_flask(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
 
-TOKEN = os.environ.get('BOT_TOKEN')
+# Дані з твого запиту
+RAPID_API_KEY = "f34d963ae4msh8d0868c59a60488p1d3362jsn35a7e001db2a"
+RAPID_API_HOST = "social-download-all-in-one.p.rapidapi.com"
+API_URL = "https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     if not url.startswith("http"): return
     
-    status = await update.message.reply_text("⏳ Обробка... Це може зайняти до хвилини.")
+    status_msg = await update.message.reply_text("🚀 Обробка через RapidAPI...")
 
-    # Налаштування згідно з офіційною документацією yt-dlp
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }],
+    headers = {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPID_API_HOST,
+        "x-rapidapi-key": RAPID_API_KEY
     }
+    
+    # Тіло запиту згідно з cURL
+    payload = {"url": url}
 
     try:
-        # Використовуємо ThreadPoolExecutor через asyncio для завантаження
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Екстракція інфо та завантаження
-            info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-            # Отримуємо шлях до фінального файлу
-            file_path = ydl.prepare_filename(info).rsplit('.', 1)[0] + '.mp4'
+        response = requests.post(API_URL, json=payload, headers=headers, timeout=30)
+        data = response.json()
 
-        if os.path.exists(file_path):
-            with open(file_path, 'rb') as video:
-                await update.message.reply_video(video=video, caption="✅ Готово!")
-            os.remove(file_path) # Очищення пам'яті
-            await status.delete()
+        # Розбір відповіді: зазвичай API повертає об'єкт з полем 'medias'
+        medias = data.get("medias", [])
+        
+        video_url = None
+        # Шукаємо перше доступне відео в списку medias
+        for item in medias:
+            if item.get("extension") == "mp4" or item.get("type") == "video":
+                video_url = item.get("url")
+                break
+        
+        # Якщо структура інша, спробуємо пряме посилання
+        if not video_url:
+            video_url = data.get("url") or data.get("link")
+
+        if video_url:
+            await update.message.reply_video(video=video_url, caption="✅ Готово!")
+            await status_msg.delete()
         else:
-            await status.edit_text("❌ Помилка: файл не знайдено.")
+            await status_msg.edit_text("❌ Відео не знайдено. Можливо, посилання приватне.")
+            print(f"DEBUG DATA: {data}") # Побачимо структуру в логах Koyeb
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        await status.edit_text(f"⚠️ Сталася помилка: {str(e)[:100]}")
+        logging.error(f"Error: {e}")
+        await status_msg.edit_text(f"⚠️ Помилка API: {str(e)[:100]}")
 
 if __name__ == '__main__':
-    # Створюємо папку для завантажень
-    if not os.path.exists('downloads'): os.makedirs('downloads')
+    # Створюємо папку для логів, якщо треба
+    logging.basicConfig(level=logging.INFO)
     
-    # Запуск Flask у фоновому потоці
+    # Запуск Flask
     Thread(target=run_flask).start()
     
-    # Запуск бота
-    application = ApplicationBuilder().token(TOKEN).build()
+    # Запуск Telegram бота
+    token = os.environ.get('BOT_TOKEN')
+    application = ApplicationBuilder().token(token).build()
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.run_polling()
