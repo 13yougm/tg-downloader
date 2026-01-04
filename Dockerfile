@@ -1,20 +1,21 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-RUN apt-get update && \
-    apt-get install -y ffmpeg git ca-certificates && \
-    update-ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-ENV PYTHONHTTPSVERIFY=0
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --upgrade certifi
 
-COPY . .
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-ENV PORT=8080
-EXPOSE 8080
+COPY app /app/app
 
-CMD ["python", "bot.py"]
+RUN useradd -m -u 10001 appuser
+USER 10001
+
+# Koyeb runs worker processes; command is overridden per service.
+CMD ["python", "-m", "app.bot"]
